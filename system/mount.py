@@ -61,11 +61,10 @@ options:
     default: 0
   state:
     description:
-      - If C(mounted) or C(unmounted), the device will be actively mounted or unmounted
-        as needed and appropriately configured in I(fstab). 
-        C(absent) and C(present) only deal with
-        I(fstab) but will not affect current mounting. If specifying C(mounted) and the mount
-        point is not present, the mount point will be created. Similarly, specifying C(absent)        will remove the mount point directory.
+      - C(absent): remove the entry from the C(fstab) file
+      - C(present): add an entry to the C(fstab) file
+      - C(unmounted): remove the entry from the C(fstab) file, unmount the file system (C(src)), and remove the mount point (C(name))
+      - C(mounted): add an entry to the fstab file, create the mount point (C(name)) if needed, and mount the file system (C(src))
     required: true
     choices: [ "present", "absent", "mounted", "unmounted" ]
     default: null
@@ -127,8 +126,8 @@ def set_mount(**kwargs):
             to_write.append(line)
             continue
         if len(line.split()) != 6:
-            # not sure what this is or why it is here
-            # but it is not our fault so leave it be
+            # The fstab file has 6 fields anything that does not is non-standard
+            #  and is safely saved but not processed
             to_write.append(line)
             continue
 
@@ -158,8 +157,7 @@ def set_mount(**kwargs):
     if changed:
         write_fstab(to_write, args['fstab'])
 
-    return (args['name'], changed)
-
+    return changed
 
 def unset_mount(**kwargs):
     """ remove a mount point from fstab """
@@ -201,10 +199,9 @@ def unset_mount(**kwargs):
     if changed:
         write_fstab(to_write, args['fstab'])
 
-    return (args['name'], changed)
+    return changed
 
-
-def mount(module, **kwargs):
+def mount_fs(module, **kwargs):
     """ mount up a path or remount if needed """
     mount_bin = module.get_bin_path('mount')
 
@@ -220,7 +217,7 @@ def mount(module, **kwargs):
     else:
         return rc, out+err
 
-def umount(module, **kwargs):
+def umount_fs(module, **kwargs):
     """ unmount a path """
 
     umount_bin = module.get_bin_path('umount')
@@ -232,6 +229,16 @@ def umount(module, **kwargs):
         return 0, ''
     else:
         return rc, out+err
+
+def get_mounted_fs(module):
+    mounted = {}
+    rc, out, err = module.run_command('mount -l')
+    if rc == 0:
+        for mount in out.split("\n")[:-1]:
+            fields = mount.split()
+            mounted[fields[2]] = fields[0]
+    return mounted
+
 
 def main():
 
@@ -254,90 +261,78 @@ def main():
     args = {
         'name': module.params['name'],
         'src': module.params['src'],
-        'fstype': module.params['fstype']
+        'fstype': module.params['fstype'],
+        'state': module.params['state']
     }
     if module.params['passno'] is not None:
         args['passno'] = module.params['passno']
     if module.params['opts'] is not None:
-        args['opts'] = module.params['opts']
-        if ' ' in args['opts']:
+        if ' ' in module.params['opts']:
             module.fail_json(msg="unexpected space in 'opts' parameter")
+        args['opts'] = module.params['opts']
     if module.params['dump'] is not None:
         args['dump'] = module.params['dump']
     if module.params['fstab'] is not None:
         args['fstab'] = module.params['fstab']
 
+    mounted_fs = get_mounted_fs(module)
+    if not mounted_fs:
+        module.fail_json(msg="Error getting list of mounted file systems")
+
     # if fstab file does not exist, we first need to create it. This mainly
-    # happens when fstab optin is passed to the module.
+    # happens when fstab option is passed to the module.
     if not os.path.exists(args['fstab']):
         if not os.path.exists(os.path.dirname(args['fstab'])):
             os.makedirs(os.path.dirname(args['fstab']))
         open(args['fstab'],'a').close()
 
-    # absent == remove from fstab and unmounted
-    # unmounted == do not change fstab state, but unmount
-    # present == add to fstab, do not change mount state
-    # mounted == add to fstab if not there and make sure it is mounted, if it has changed in fstab then remount it
-
-    state = module.params['state']
-    name  = module.params['name']
-    if state == 'absent':
-        name, changed = unset_mount(**args)
-        if changed:
-            if os.path.ismount(name):
-                res,msg  = umount(module, **args)
-                if res:
-                    module.fail_json(msg="Error unmounting %s: %s" % (name, msg))
-
-            if os.path.exists(name):
-                try:
-                    os.rmdir(name)
-                except (OSError, IOError), e:
-                    module.fail_json(msg="Error rmdir %s: %s" % (name, str(e)))
-
+    if args['state'] == 'absent':
+        changed = unset_mount(**args)
         module.exit_json(changed=changed, **args)
 
-    if state == 'unmounted':
-        if os.path.ismount(name):
-            res,msg  = umount(module, **args)
-            if res:
-                module.fail_json(msg="Error unmounting %s: %s" % (name, msg))
+    if args['state'] == 'present':
+        changed = set_mount(**args)
+        module.exit_json(changed=changed, **args)
+
+    if args['state'] == 'unmounted':
+        changed = unset_mount(**args)
+
+        if args['name'] in mounted_fs:
+            rc, msg  = umount_fs(module, **args)
+            if rc:
+                module.fail_json(msg="Error unmounting %s: %s" % (args['name'], msg))
             changed = True
 
+        # In the event the file system wasn't mounted, but the mount point still 
+        #   exists we should try to remove it
+        if os.path.exists(args['name']):
+            try:
+                # We are using rmdir() in case there was data under the mount point
+                #   the user may not want to lose it.
+                os.rmdir(args['name'])
+                changed = True
+            except (OSError), e:
+                module.fail_json(msg="Error removing mount point %s: %s" % (args['name'], str(e)))
+
         module.exit_json(changed=changed, **args)
 
-    if state in ['mounted', 'present']:
-        if state == 'mounted':
-            if not os.path.exists(name):
-                try:
-                    os.makedirs(name)
-                except (OSError, IOError), e:
-                    module.fail_json(msg="Error making dir %s: %s" % (name, str(e)))
+    if args['state'] == 'mounted':
+        changed = set_mount(**args)
 
-        name, changed = set_mount(**args)
-        if state == 'mounted':
-            res = 0
-            if os.path.ismount(name):
-                if changed:
-                    res,msg = mount(module, **args)
-            elif 'bind' in args.get('opts', []):
+        if not os.path.exists(args['name']):
+            try:
+                os.makedirs(args['name'])
                 changed = True
-                cmd = 'mount -l'
-                rc, out, err = module.run_command(cmd)
-                allmounts = out.split('\n')
-                for mounts in allmounts[:-1]:
-                    arguments = mounts.split()
-                    if arguments[0] == args['src'] and arguments[2] == args['name'] and arguments[4] == args['fstype']:
-                        changed = False
-                if changed:
-                    res,msg = mount(module, **args)
-            else:
-                changed = True
-                res,msg = mount(module, **args)
+            except (OSError, IOError), e:
+                unset_mount(**args)
+                module.fail_json(msg="Error making dir %s: %s" % (args['name'], str(e)))
 
-            if res:
-                module.fail_json(msg="Error mounting %s: %s" % (name, msg))
 
+        if args['name'] not in mounted_fs or changed:
+            rc, msg = mount_fs(module, **args)
+            if rc:
+                unset_mount(**args)
+                module.fail_json(msg="Error mounting %s: %s" % (args['name'], msg))
 
         module.exit_json(changed=changed, **args)
 
